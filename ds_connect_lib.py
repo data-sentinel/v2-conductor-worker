@@ -47,12 +47,17 @@
 #                              same code, whatever the type); one sign-in attempt; time limits per step; secret
 #                              scrub; from_legacy for workers still on a V1 database. The V1 surface is unchanged
 #                              apart from a lock around the one-time Oracle thick initialisation.
-__version__ = '2026.47.2'    # architect's reply 2026-46-33: no_reply - a host that took the connection and then said
+#__version__ = '2026.47.2'   # architect's reply 2026-46-33: no_reply - a host that took the connection and then said
 #                              nothing is reported with the limit that applied, and check_timeout is kept for the
 #                              whole limit and for a check with no host; file roots are looked at when a path is
 #                              checked, so a share mounted after start works (root_not_mounted names a root that
 #                              isn't there); from_legacy turns Laserfiche's certificatetrust over, because V1 had
 #                              it backwards; 41 codes in the catalogue.
+__version__ = '2026.47.3'    # for the discovery walks (discover_note_2026.47.1): handle.call and the HTTP handle's surface
+#                              named as a caller's to use; connect(..., retries=N) for 429 and 503 on a long walk, with
+#                              retry_after in service_error when it gives up; handle.token_for(resource) on the Entra types;
+#                              handle.as_user(email) on gmail and gdocs; optional permissions in types() (Teams chats);
+#                              a handle used from several threads is tested. Nothing that 2026.47.2 had changes.
 
 import os
 import re
@@ -64,6 +69,7 @@ import struct
 import logging
 import time
 import threading
+import collections
 import importlib
 import importlib.util
 import urllib.parse
@@ -465,6 +471,7 @@ STEP_LOOKUP_SEC = 5                 # name lookup
 STEP_TCP_SEC = 10                   # TCP connection
 STEP_TOKEN_SEC = 10                 # a token request
 STEP_CALL_SEC = 15                  # one API call, one statement, one driver sign-in
+RETRY_WAIT_MAX_SEC = 300            # connect(..., retries=N): the longest a Retry-After is waited for, once
 _CLEANUP_MARGIN_SEC = 1.0           # the library answers this much before the caller's own limit of the same length
 
 _APP_NAME = "Data Sentinel"         # what a DBA sees as the client's name
@@ -530,7 +537,9 @@ _CATALOGUE = (
 _BY_CODE = {_c[0]: _c for _c in _CATALOGUE}
 
 CheckResult = namedtuple("CheckResult", "status ms code params message")
-TypeInfo = namedtuple("TypeInfo", "checkable available missing secret_keys permissions")
+TypeInfo = namedtuple("TypeInfo", "checkable available missing secret_keys permissions optional", defaults=(None,))
+# 'optional': permissions a walk may need for an option of its own that the check doesn't ask about (2026.47.3),
+# so the app can tell the administrator. Read the fields by name: more may be added.
 
 
 def catalogue():
@@ -667,6 +676,7 @@ class _Ctx(object):
         self.connected = False          # a TCP connection to the host has succeeded
         self.checking = True            # False for connect(): the limits then end with the sign-in
         self.cap = None                 # the limit of the step now running, in seconds
+        self.retries = 0                # connect(..., retries=N): how often a 429 or 503 is tried again on a long walk
 
     def left(self):
         return self.t_end - time.monotonic()
@@ -903,7 +913,24 @@ class Handle(object):
     """A signed-in connection to a customer's system. '.client' is what a scanner
     works with: the driver's connection for a database, the client for MongoDB,
     the session for an HTTP type, the resolved path for a file system. Leaving
-    the 'with' block closes everything; a token lives as long as the handle."""
+    the 'with' block closes everything; a token lives as long as the handle.
+
+    For the HTTP types these are a caller's to use too, and a change to any of them is
+    announced as a change to this library's calls is (2026.47.3):
+        handle.call(method, url, **kw)   one call with the proxy, the time limits, the mapping of
+                                         TLS and network failures to codes, and the 429/503 handling
+                                         (connect's 'retries'); returns the response, or raises ConnectError
+        handle.token                     the bearer: handle.token() is the current token,
+                                         handle.token.auth() the Authorization header
+        handle.token_for(resource)       Entra types: a bearer for another resource from the same app
+        handle.as_user(email)            gmail, gdocs: a bearer with the same scopes acting as that user
+        handle.base_url, .site_host, .roles, .shown_host, .repository_id, .scopes
+                                         where the type has them (None or absent where it hasn't)
+        handle.http                      kept for code written on 2026.47.2; handle.call is the same call
+    Threads: an HTTP handle may be used from several threads at once (the bearer has a lock,
+    the connection pool keeps 10 connections per host; more threads wait for one, they don't
+    fail), and so may a mongo handle. A database handle (postgres, sqlserver, oracle_*) is one
+    per thread."""
 
     def __init__(self, source_type, client, closer=None, **extra):
         self.source_type = source_type
@@ -919,6 +946,13 @@ class Handle(object):
     def __exit__(self, *_exc):
         self.close()
         return False
+
+    def call(self, method, url, **kw):
+        """One HTTP call on this handle's session (HTTP types only). See the class's note."""
+        _http = getattr(self, "http", None)
+        if _http is None:
+            raise AttributeError("call() is for the HTTP types; " + str(self.source_type) + " has no HTTP session")
+        return _http.call(method, url, **kw)
 
     def close(self):
         if self._closed:
@@ -944,7 +978,8 @@ class Handle(object):
 #       open         (connection, ctx) -> Handle      reach the host and sign in once
 #       probe        (handle, connection, ctx)        the one small read that proves the account can work
 # ---------------------------------------------------------------------------
-_Connector = namedtuple("_Connector", "source_type fields secret_keys needs permissions open probe")
+_Connector = namedtuple("_Connector", "source_type fields secret_keys needs permissions open probe optional",
+                        defaults=(None,))
 _CONNECTORS = {}
 # the order types() lists them in: databases, Microsoft, Google, the rest, files
 _TYPE_ORDER = ("postgres", "sqlserver", "oracle_service", "oracle_sid", "mongo", "databricks", "fabric", "dynamics",
@@ -952,9 +987,10 @@ _TYPE_ORDER = ("postgres", "sqlserver", "oracle_service", "oracle_sid", "mongo",
                "blink", "directory")
 
 
-def _register(source_type, fields, secret_keys, needs, open_fn, probe_fn, permissions=None):
+def _register(source_type, fields, secret_keys, needs, open_fn, probe_fn, permissions=None, optional=None):
     _CONNECTORS[source_type] = _Connector(source_type, tuple(fields), tuple(secret_keys), tuple(needs),
-                                          tuple(permissions) if permissions else None, open_fn, probe_fn)
+                                          tuple(permissions) if permissions else None, open_fn, probe_fn,
+                                          tuple(optional) if optional else None)
 
 
 def _module_present(name):
@@ -1040,7 +1076,7 @@ def types():
     for _name in sorted(_CONNECTORS, key=lambda _n: (_TYPE_ORDER.index(_n) if _n in _TYPE_ORDER else len(_TYPE_ORDER), _n)):
         _c = _CONNECTORS[_name]
         _m = _missing_component(_c)
-        _out[_name] = TypeInfo(True, _m is None, _m, _c.secret_keys, _c.permissions)
+        _out[_name] = TypeInfo(True, _m is None, _m, _c.secret_keys, _c.permissions, _c.optional)
     return _out
 
 
@@ -1143,7 +1179,8 @@ def _safe_error(exc, secrets):
     return ConnectError("unexpected", {"reason": _reason(exc, secrets)})
 
 
-def connect(source_type, connection, *, timeout=DEFAULT_TIMEOUT_SEC, file_roots=None, ca_file=None, proxy=None):
+def connect(source_type, connection, *, timeout=DEFAULT_TIMEOUT_SEC, file_roots=None, ca_file=None, proxy=None,
+            retries=0):
     """Reach the host, sign in once, and return a Handle: the client or session a
     scanner would work with. Use it in a 'with' block; leaving it closes everything.
 
@@ -1153,6 +1190,11 @@ def connect(source_type, connection, *, timeout=DEFAULT_TIMEOUT_SEC, file_roots=
         file_roots    the folders mounted for the workers (file system types)
         ca_file       one file with every authority to trust; None = the system's
         proxy         {'https': url, 'no_proxy': 'a,b'} for the HTTP types; None = no proxy
+        retries       HTTP types, for a long walk: a 429 or 503 is tried again up to this many times,
+                      waiting as Retry-After says (5 minutes at most a wait), or 2, 4, 8 ... 60 seconds
+                      when it doesn't say; when it gives up, service_error's params carry 'retry_after',
+                      the seconds the server last asked for. 0 (the default, and always for check()):
+                      one retry, only when Retry-After says and the wait fits in the time that's left
 
     Raises ConnectError(code, params) on failure; nothing else, and never with a secret."""
     _err = None
@@ -1161,6 +1203,10 @@ def connect(source_type, connection, *, timeout=DEFAULT_TIMEOUT_SEC, file_roots=
         _connector, _c, _ctx = _prepare(source_type, connection, timeout, file_roots, ca_file, proxy)
         _secrets = _ctx.secrets
         _ctx.checking = False
+        try:
+            _ctx.retries = max(0, min(100, int(retries or 0)))
+        except (TypeError, ValueError):
+            _ctx.retries = 0
         _handle = _open(_connector, _c, _ctx)
         _ctx.t_end = float("inf")       # 'timeout' was for the sign-in; what the caller does next is the caller's
         return _handle
@@ -1852,7 +1898,8 @@ class _Http(object):
         _shown = shown or urllib.parse.urlsplit(url).hostname
         _port = _target.port or (443 if _target.scheme == "https" else 80)
         _proxy = self.proxy_for(_real)
-        _retried = False
+        _tries = 0
+        _asked = None                   # the last Retry-After the server gave, in seconds
         while True:
             _cap = self.ctx.step(step)
             _err = None
@@ -1889,14 +1936,25 @@ class _Http(object):
             if _err is not None:
                 raise _err
             _status = _resp.status_code
-            if _status in (429, 503) and not _retried:
+            if _status in (429, 503):
                 _wait = self._retry_after(_resp)
-                if _wait is not None and _wait <= self.ctx.left() - 1.0:
-                    _retried = True
-                    time.sleep(_wait)
-                    continue
+                if _wait is not None:
+                    _asked = _wait
+                _more = self.ctx.retries        # a long walk's retries; 0: the check's single retry
+                if _tries < max(1, _more):
+                    if _more and _wait is None:
+                        _wait = min(60.0, 2.0 ** (_tries + 1))          # 2, 4, 8 ... 60
+                    if _more and _wait is not None:
+                        _wait = min(_wait, RETRY_WAIT_MAX_SEC)
+                    if _wait is not None and _wait <= self.ctx.left() - 1.0:
+                        _tries += 1
+                        time.sleep(_wait)
+                        continue
             if _status >= 500 or _status == 429:
-                raise ConnectError("service_error", {"host": _shown, "status": _status, "status_text": _status_text(_status)})
+                _params = {"host": _shown, "status": _status, "status_text": _status_text(_status)}
+                if self.ctx.retries and _asked is not None:
+                    _params["retry_after"] = int(-(-_asked // 1))
+                raise ConnectError("service_error", _params)
             return _resp
 
     @staticmethod
@@ -2030,6 +2088,27 @@ def _entra_bearer(ctx, http, c, authority, resource):
     return _bearer
 
 
+def _entra_token_for(ctx, http, c, authority):
+    """handle.token_for(resource) on the Entra types: a bearer for another resource from the same app and the
+    same credentials, such as https://storage.azure.com for OneLake (2026.47.3). One per resource, kept with
+    the handle and renewed like the first. Raises ConnectError as a sign-in does."""
+    _made = {}
+    _lock = threading.Lock()
+
+    def token_for(resource):
+        _r = str(resource or "").strip().rstrip("/")
+        if not _r.lower().startswith("https://"):
+            raise ConnectError("unexpected", {"reason": "token_for needs the resource as an https address"})
+        with _lock:
+            _bearer = _made.get(_r.lower())
+            if _bearer is None:
+                _bearer = _Bearer(lambda: _entra_fetch(ctx, http, c, authority, _r))
+                _made[_r.lower()] = _bearer
+        _bearer()
+        return _bearer
+    return token_for
+
+
 def _read_denied(resp, permission=None, host=None):
     """401 after sign-in: the token was rejected. 403: the permission when it can be named."""
     if resp.status_code == 401:
@@ -2088,7 +2167,8 @@ def _graph_open_for(source_type):
                 if not any(_a in _roles for _a in _alternatives):
                     raise ConnectError("permission_missing", {"permission": _alternatives[0]})
         http.reach(_graph)
-        return _http_handle(source_type, http, _bearer, base_url=_graph, roles=_roles, site_host=_site_host)
+        return _http_handle(source_type, http, _bearer, base_url=_graph, roles=_roles, site_host=_site_host,
+                            token_for=_entra_token_for(ctx, http, c, _entra_authority(_graph_host)))
     return _http_open(_sign_in)
 
 
@@ -2119,10 +2199,12 @@ def _graph_probe(handle, c, ctx):
 
 _ENTRA_FIELDS = (("base_url", True, None), ("tenant_id", True, None), ("client_id", True, None), ("client_secret", True, None))
 _GRAPH_FIELDS = (("base_url", False, _GRAPH_DEFAULT),) + _ENTRA_FIELDS[1:]
+# what a walk may need for an option of its own, which the check doesn't ask about (2026.47.3)
+_GRAPH_OPTIONAL = {"teams": ("Chat.Read.All",)}     # chats with their members and messages, when the walk reads chats
 for _t in ("sharepoint", "onedrive", "msoutlook", "teams"):
     _register(_t, fields=_ENTRA_FIELDS if _t == "sharepoint" else _GRAPH_FIELDS, secret_keys=("client_secret",),
               needs=("http",), open_fn=_graph_open_for(_t), probe_fn=_graph_probe,
-              permissions=tuple(_a[0] for _a in _GRAPH_PERMISSIONS[_t]))
+              permissions=tuple(_a[0] for _a in _GRAPH_PERMISSIONS[_t]), optional=_GRAPH_OPTIONAL.get(_t))
 
 
 # ---------------------------------------------------------------------------
@@ -2137,7 +2219,8 @@ def _entra_api_open_for(source_type):
         _origin, _host, _full = _url_parts(c.get("base_url"))
         http.reach(_full)
         _bearer = _entra_bearer(ctx, http, c, _entra_authority(_host), _origin)
-        return _http_handle(source_type, http, _bearer, base_url=_origin, shown_host=_host)
+        return _http_handle(source_type, http, _bearer, base_url=_origin, shown_host=_host,
+                            token_for=_entra_token_for(ctx, http, c, _entra_authority(_host)))
     return _http_open(_sign_in)
 
 
@@ -2234,7 +2317,8 @@ def _signed_jwt(ctx, claims, private_key_pem, passphrase=None, key_id=None, algo
     return _token if isinstance(_token, str) else _token.decode("ascii")
 
 
-def _google_fetch(ctx, http, c, source_type):
+def _google_fetch(ctx, http, c, source_type, reach=True):
+    """One token request. reach=False for handle.as_user: the token host was reached at the sign-in."""
     _key = c.get("credentials_json") if isinstance(c.get("credentials_json"), dict) else {}
     for _part in ("client_email", "private_key"):
         if _is_empty(_key.get(_part)):
@@ -2248,7 +2332,8 @@ def _google_fetch(ctx, http, c, source_type):
                                    "scope": " ".join(_GOOGLE_SCOPES[source_type]), "aud": _token_uri,
                                    "iat": _now, "exp": _now + 600},
                              _key["private_key"], key_id=_key.get("private_key_id"))
-    http.reach(_token_uri)
+    if reach:
+        http.reach(_token_uri)
     _resp = http.call("POST", _token_uri, step=STEP_TOKEN_SEC, data={"grant_type": _JWT_GRANT, "assertion": _assertion})
     _body = _json_body(_resp)
     if _resp.status_code == 200 and _body.get("access_token"):
@@ -2264,11 +2349,39 @@ def _google_fetch(ctx, http, c, source_type):
             ("the token request answered " + str(_resp.status_code) + " " + _status_text(_resp.status_code))), ctx.secrets)})
 
 
+GOOGLE_AS_USER_KEPT = 256           # handle.as_user: the most users whose bearers a handle keeps at once
+
+
+def _google_as_user(ctx, http, c, source_type):
+    """handle.as_user(email) on gmail and gdocs: a bearer with the same scopes and 'sub' set to that user of the
+    domain, signed with the key the handle already holds - one token request, no lookup or probe (2026.47.3).
+    The most recent GOOGLE_AS_USER_KEPT are kept with the handle and renewed like the first."""
+    _made = collections.OrderedDict()
+    _lock = threading.Lock()
+
+    def as_user(email):
+        _user = str(email or "").strip()
+        if "@" not in _user:
+            raise ConnectError("connection_incomplete", {"key": "delegated_user"})
+        with _lock:
+            _bearer = _made.pop(_user.lower(), None)
+            if _bearer is None:
+                _c = dict(c, delegated_user=_user)
+                _bearer = _Bearer(lambda: _google_fetch(ctx, http, _c, source_type, reach=False))
+            _made[_user.lower()] = _bearer
+            while len(_made) > GOOGLE_AS_USER_KEPT:
+                _made.popitem(last=False)
+        _bearer()
+        return _bearer
+    return as_user
+
+
 def _google_open_for(source_type):
     def _sign_in(c, ctx, http):
         _bearer = _Bearer(lambda: _google_fetch(ctx, http, c, source_type))
         _bearer()
-        return _http_handle(source_type, http, _bearer, scopes=_GOOGLE_SCOPES[source_type])
+        return _http_handle(source_type, http, _bearer, scopes=_GOOGLE_SCOPES[source_type],
+                            as_user=_google_as_user(ctx, http, c, source_type))
     return _http_open(_sign_in)
 
 
